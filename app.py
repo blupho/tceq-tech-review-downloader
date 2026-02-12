@@ -17,8 +17,8 @@ def get_configured_session():
     session = requests.Session()
     
     retry_strategy = Retry(
-        total=5,  # Increased retries
-        backoff_factor=2,  # Increased backoff (2s, 4s, 8s, 16s, 32s)
+        total=10,  # Significantly increased retries
+        backoff_factor=5,  # Aggressive backoff (5s, 10s, 20s...)
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
     )
@@ -66,6 +66,10 @@ def search_tceq(rn_number):
         # Visit search page first to mimic a real user and get cookies
         # Use a proper timeout
         session.get("https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH", timeout=30)
+        
+        # Add a random delay to mimic human behavior
+        import random
+        time.sleep(random.uniform(2, 5))
         
         # Update Referer for the search action
         session.headers.update({
