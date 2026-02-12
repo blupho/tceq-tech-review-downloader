@@ -6,6 +6,12 @@ import time
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
 
 # Base URL for TCEQ search
 BASE_URL = "https://records.tceq.texas.gov/cs/idcplg"
@@ -13,12 +19,13 @@ BASE_URL = "https://records.tceq.texas.gov/cs/idcplg"
 def get_configured_session():
     """
     Creates a requests Session with robust retry logic and browser-like headers.
+    Used for file downloads.
     """
     session = requests.Session()
     
     retry_strategy = Retry(
-        total=10,  # Significantly increased retries
-        backoff_factor=5,  # Aggressive backoff (5s, 10s, 20s...)
+        total=5,
+        backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
     )
@@ -29,61 +36,74 @@ def get_configured_session():
     # Browser-like headers
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "*/*",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
     })
     return session
 
 def search_tceq(rn_number):
     """
-    Search TCEQ records for a given RN.
-    Returns the response object.
+    Search TCEQ records for a given RN using Selenium to bypass bot detection.
+    Returns the page source (HTML string).
     """
-    params = {
-        "IdcService": "TCEQ_PERFORM_SEARCH",
-        "xRecordSeries": "1081",  # AIR / New Source Review Permit
-        "select0": "xRefNumTxt",  # Central Registry RN
-        "input0": rn_number,
-        "ResultCount": "20",      # Start with fewer results
-        "xIdcProfile": "Record",
-        "IsExternalSearch": "1",
-        "newSearch": "true",
-        "SortField": "dInDate",
-        "SortOrder": "Desc"
-    }
-    
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    # Add a user agent just in case
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    driver = None
     try:
-        session = get_configured_session()
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # Visit search page first to mimic a real user and get cookies
-        # Use a proper timeout
-        session.get("https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH", timeout=30)
+        driver.get("https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH")
         
-        # Add a random delay to mimic human behavior
-        import random
-        time.sleep(random.uniform(2, 5))
+        # Select Record Series: AIR / New Source Review Permit (1081)
+        # Use CSS selector to be safe
+        select_series = Select(driver.find_element(By.CSS_SELECTOR, "select[name='xRecordSeries']"))
+        select_series.select_by_value("1081") 
         
-        # Update Referer for the search action
-        session.headers.update({
-            "Referer": "https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH",
-            "Origin": "https://records.tceq.texas.gov"
-        })
+        # Select RN Search
+        select0 = Select(driver.find_element(By.CSS_SELECTOR, "select[name='select0']"))
+        select0.select_by_value("xRefNumTxt")
         
-        # Use POST request
-        response = session.post(BASE_URL, data=params, timeout=60)
-        response.raise_for_status()
-        return response
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error connecting to TCEQ: {e}")
+        # Enter RN
+        # Find the visible input0
+        inputs = driver.find_elements(By.NAME, "input0")
+        target_input = None
+        for inp in inputs:
+            if inp.is_displayed() and inp.is_enabled():
+                target_input = inp
+                break
+        
+        if target_input:
+            target_input.clear()
+            target_input.send_keys(rn_number)
+            
+            # Submit
+            # Try finding submit button first
+            submit_btns = driver.find_elements(By.XPATH, "//input[@type='submit' or @value='Search']")
+            if submit_btns:
+                submit_btns[0].click()
+            else:
+                target_input.submit()
+            
+            # Wait for results
+            time.sleep(5) # Basic wait, could be improved with WebDriverWait
+            
+            return driver.page_source
+        else:
+            st.error("Could not find search input field on TCEQ page.")
+            return None
+
+    except Exception as e:
+        st.error(f"Error connecting to TCEQ via Selenium: {e}")
         return None
+    finally:
+        if driver:
+            driver.quit()
 
 def parse_results(html_content):
     """
@@ -190,10 +210,11 @@ if "raw_search_results" not in st.session_state:
 
 if st.button("Search Documents"):
     with st.spinner(f"Searching TCEQ Database for {rn_input}..."):
-        response = search_tceq(rn_input)
+        # search_tceq now returns HTML string (page_source) or None
+        html_content = search_tceq(rn_input)
         
-        if response:
-            data = parse_results(response.content)
+        if html_content:
+            data = parse_results(html_content)
             
             if not data:
                 st.warning("No documents found for this RN.")
