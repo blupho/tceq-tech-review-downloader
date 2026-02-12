@@ -4,9 +4,43 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import time
 from urllib.parse import urljoin
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # Base URL for TCEQ search
 BASE_URL = "https://records.tceq.texas.gov/cs/idcplg"
+
+def get_configured_session():
+    """
+    Creates a requests Session with robust retry logic and browser-like headers.
+    """
+    session = requests.Session()
+    
+    retry_strategy = Retry(
+        total=5,  # Increased retries
+        backoff_factor=2,  # Increased backoff (2s, 4s, 8s, 16s, 32s)
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    # Browser-like headers
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    })
+    return session
 
 def search_tceq(rn_number):
     """
@@ -26,33 +60,21 @@ def search_tceq(rn_number):
         "SortOrder": "Desc"
     }
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Referer": "https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH"
-    }
-
     try:
-        session = requests.Session()
+        session = get_configured_session()
         
-        # Retry logic
-        from requests.adapters import HTTPAdapter
-        from requests.packages.urllib3.util.retry import Retry
+        # Visit search page first to mimic a real user and get cookies
+        # Use a proper timeout
+        session.get("https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH", timeout=30)
         
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-
-        # Visit search page first to get cookies
-        session.get("https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH", headers=headers)
+        # Update Referer for the search action
+        session.headers.update({
+            "Referer": "https://records.tceq.texas.gov/cs/idcplg?IdcService=TCEQ_SEARCH",
+            "Origin": "https://records.tceq.texas.gov"
+        })
         
         # Use POST request
-        response = session.post(BASE_URL, data=params, headers=headers)
+        response = session.post(BASE_URL, data=params, timeout=60)
         response.raise_for_status()
         return response
     except requests.exceptions.RequestException as e:
@@ -133,7 +155,8 @@ def parse_results(html_content):
 
 def download_file(url, filename):
     try:
-        r = requests.get(url, stream=True)
+        session = get_configured_session()
+        r = session.get(url, stream=True, timeout=120)  # Long timeout for downloads
         r.raise_for_status()
         with open(filename, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192): 
@@ -157,6 +180,10 @@ rn_input = st.sidebar.text_input("Central Registry RN", value="RN100210517")
 start_year = st.sidebar.number_input("Start Year", min_value=1900, max_value=2100, value=2010)
 end_year = st.sidebar.number_input("End Year", min_value=1900, max_value=2100, value=2025)
 
+# Initialize session state for search results
+if "raw_search_results" not in st.session_state:
+    st.session_state.raw_search_results = None
+
 if st.button("Search Documents"):
     with st.spinner(f"Searching TCEQ Database for {rn_input}..."):
         response = search_tceq(rn_input)
@@ -166,62 +193,78 @@ if st.button("Search Documents"):
             
             if not data:
                 st.warning("No documents found for this RN.")
+                st.session_state.raw_search_results = None
             else:
-                # Filter by Title and Year
-                filtered_data = []
-                for item in data:
-                    # Filter: Check if "Technical Review" is in Title OR Document Type
-                    # Case insensitive check
-                    text_to_check = (item.get('Title', '') + " " + item.get('Document Type', '')).lower()
-                    if "technical review" not in text_to_check:
-                        continue
+                st.session_state.raw_search_results = data
+                st.success("Search complete!")
 
-                    try:
-                        # Parse date. Formats can vary, often MM/DD/YYYY
-                        doc_year = None
-                        if item['Date']:
-                            parts = item['Date'].split('/')
-                            if len(parts) == 3:
-                                doc_year = int(parts[2])
-                        
-                        if doc_year and start_year <= doc_year <= end_year:
-                             filtered_data.append(item)
-                        elif not doc_year:
-                             # Include unknown dates?
-                             pass
-                    except ValueError:
-                        pass
+# Display and Filtering Logic
+if st.session_state.raw_search_results:
+    data = st.session_state.raw_search_results
+    
+    # Filter by Title and Year
+    filtered_data = []
+    for item in data:
+        # Filter: Check if "Technical Review" is in Title OR Document Type
+        # Case insensitive check
+        text_to_check = (item.get('Title', '') + " " + item.get('Document Type', '')).lower()
+        if "technical review" not in text_to_check:
+            continue
+
+        try:
+            # Parse date. Formats can vary, often MM/DD/YYYY
+            doc_year = None
+            if item['Date']:
+                parts = item['Date'].split('/')
+                if len(parts) == 3:
+                    doc_year = int(parts[2])
+            
+            if doc_year and start_year <= doc_year <= end_year:
+                 filtered_data.append(item)
+            elif not doc_year:
+                 # Include unknown dates?
+                 pass
+        except ValueError:
+            pass
+    
+    if filtered_data:
+        st.info(f"Showing {len(filtered_data)} documents matching criteria (Found {len(data)} total).")
+        df = pd.DataFrame(filtered_data)
+        
+        # Display table
+        st.dataframe(df[['Document ID', 'Document Type', 'Title', 'Date']], use_container_width=True)
+        
+        # Create downloads directory
+        import os
+        if not os.path.exists("downloads"):
+            os.makedirs("downloads")
+
+        # Download All Button
+        if st.button("Download All Found Documents"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, doc in enumerate(filtered_data):
+                safe_title = "".join([c for c in doc['Title'] if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                filename = f"downloads/{doc['Date'].replace('/', '-')}_{safe_title}_{doc['Document ID']}.pdf"
                 
-                if filtered_data:
-                    st.success(f"Found {len(filtered_data)} matching documents between {start_year} and {end_year}.")
-                    df = pd.DataFrame(filtered_data)
-                    
-                    # Display table
-                    st.dataframe(df[['Document ID', 'Document Type', 'Title', 'Date']], use_container_width=True)
-                    
-                    # Create downloads directory
-                    import os
-                    if not os.path.exists("downloads"):
-                        os.makedirs("downloads")
+                status_text.text(f"Downloading {filename}...")
+                success = download_file(doc['Download URL'], filename)
+                
+                if not success:
+                    st.error(f"Failed to download {doc['Document ID']}")
+                
+                # Be polite to the server
+                time.sleep(1)
+                
+                progress_bar.progress((i + 1) / len(filtered_data))
+            
+            st.success(f"Download complete! Files saved to {os.path.abspath('downloads')}")
+            
+        # Individual Download Links
+        st.markdown("### Direct Links")
+        for index, row in df.iterrows():
+            st.markdown(f"[{row['Document ID']} - {row['Title']}]({row['Download URL']})")
+    else:
+        st.warning(f"Found {len(data)} documents, but none matched 'Technical Review' in the year range {start_year}-{end_year}.")
 
-                    # Download All Button
-                    if st.button("Download All Found Documents"):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        for i, doc in enumerate(filtered_data):
-                            safe_title = "".join([c for c in doc['Title'] if c.isalpha() or c.isdigit() or c==' ']).rstrip()
-                            filename = f"downloads/{doc['Date'].replace('/', '-')}_{safe_title}_{doc['Document ID']}.pdf"
-                            
-                            status_text.text(f"Downloading {filename}...")
-                            download_file(doc['Download URL'], filename)
-                            
-                            progress_bar.progress((i + 1) / len(filtered_data))
-                        
-                        st.success(f"Download complete! Files saved to {os.path.abspath('downloads')}")
-                        
-                    # Individual Download Links
-                    for index, row in df.iterrows():
-                        st.markdown(f"[{row['Document ID']} - {row['Title']}]({row['Download URL']})")
-                else:
-                    st.info(f"Found documents for {rn_input}, but none matched 'Technical Review' in the year range.")
