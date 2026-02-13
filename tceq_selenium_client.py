@@ -1,3 +1,4 @@
+import os
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -21,8 +22,20 @@ class TCEQSeleniumClient:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         
-        # Use webdriver_manager to automatically handle driver installation
-        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        # Check for system-installed Chromium and ChromeDriver (common in Streamlit Cloud)
+        system_chromium = "/usr/bin/chromium"
+        system_chromedriver = "/usr/bin/chromedriver"
+        
+        if os.path.exists(system_chromium) and os.path.exists(system_chromedriver):
+            print(f"Using system binaries: {system_chromium} and {system_chromedriver}")
+            options.binary_location = system_chromium
+            service = Service(system_chromedriver)
+            self.driver = webdriver.Chrome(service=service, options=options)
+        else:
+            print("Using webdriver_manager for Chrome...")
+            # Use webdriver_manager to automatically handle driver installation
+            self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            
         self.wait = WebDriverWait(self.driver, 20) # 20 seconds explicit wait
 
     def close(self):
